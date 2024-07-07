@@ -125,11 +125,11 @@ def type_key(order: Tuple[Type[Block], ...] | None = None,
             try:
                 sub_key = cast(Callable[[_BA], Key], sub_keys[blk_type])
             except KeyError:
+                sub_key = None
                 for key_type, key_gen in sub_keys.items():
                     if issubclass(blk_type, key_type):
                         sub_key = cast(Callable[[_BA], Key], key_gen)
                         break
-                sub_key = None
 
             return type_idx, sub_key
 
