@@ -311,7 +311,32 @@ class _BlockJunk:
 
 class SortBlocksMiddleware(LibraryMiddleware):
     """
-    TODO
+    Sort blocks according to an arbitrary key.
+
+    Keys are specified by key generator functions, i.e., functions that accept
+    a block and return a key object that supports rich comparison and
+    implements a total order without evaluation side-effects.
+
+    To simplify key definition, the user can specify a list or tuple of key
+    generators to generate a lexicographic key. Further key generation helpers
+    are:
+
+        - `compare_key()`, which makes a compare function into a key;
+        - `reverse_key()`, which reverses the order of a key or of a
+            component of a lexicographic key;
+        - `type_key()`, which sorts blocks by type and allows for
+            type-specific sub-keys.
+
+    Args:
+        key: Description of the sorting key.
+        reverse: Indicates that the sorting order should be reversed. Off by
+            default.
+        preserve_comments_on_top: Indicates that comments should stay attached
+            to the next non-comment block after them during sorting as opposed
+            to being sorted as well. On by default.
+        allow_inplace_modification: Indicates that the `transform()` function
+            should modify the input library instead of making a copy. On by
+            default.
     """
     _key: Callable[[Block], Key]
     _reverse: bool
