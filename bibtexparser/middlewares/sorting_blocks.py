@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from dataclasses import field
 from functools import cmp_to_key, lru_cache
 import operator
-from typing import Any, Generic, TypeVar, cast, runtime_checkable
+from typing import Any, Generic, TypeVar, cast, overload, override
 from typing import List
 from typing import Protocol
 from typing import Tuple
@@ -24,13 +24,16 @@ from .middleware import LibraryMiddleware
 
 class Key(Protocol):
     """
-    Helper protocol for objects that support all comparison operations.
+    Protocol for sorting keys.
 
-    This is the recommended protocol for a sorting key. Technically, only
-    `__lt__` is required for Python's standard sorting methods. However,
-    providing all of them is recommended (see PEP 8). If you define `__eq__`
-    and one of the remaining operations, then the `functools.total_ordering`
-    decorator can define the remaining operations.
+    Sorting keys must implement the rich comparison operations `__lt__`,
+    `__le__`, `__gt__`, and `__ge__`, as well as `__eq__`. These must
+    follow the criteria for a total order relation and must not have any
+    side effects.
+
+    It is possible to derive the remaining operations from `__eq__` and one
+    of the remaining comparisons with the `@functools.total_ordering`
+    decorator.
     """
     def __eq__(self, obj, /) -> bool:
         ...
@@ -49,112 +52,242 @@ class Key(Protocol):
 
 
 _BA = TypeVar("_BA", bound=Block, contravariant=True)
+_K = TypeVar("_K", bound=Key)
+_TK = TypeVar("_TK")
+_V = TypeVar("_V")
 
 
-@runtime_checkable
-class KeyGeneratorTemplate(Protocol, Generic[_BA]):
-    def as_key_gen(self) -> Callable[[_BA], Key]:
-        ...
+
+class _ReversedKey(Key, Generic[_K]):
+    """
+    Special key that reverses order.
+
+    By default, Python sorting functions sort in ascending order. By wrapping
+    a key in one of these objects, the order relation is reversed and Python
+    sorts in descending order.
+
+    This can only be compared to other reversed keys. It is used internally by
+    `descending_key`.`
+    """
+    base: _K
+
+    def __init__(self, base: _K):
+        self.base = base
+
+    def __eq__(self, other, /) -> bool:
+        return self.base == other.base
+
+    def __lt__(self, other, /) -> bool:
+        return self.base > other.base
+
+    def __le__(self, other, /) -> bool:
+        return self.base >= other.base
+
+    def __gt__(self, other, /) -> bool:
+        return self.base < other.base
+
+    def __ge__(self, other, /) -> bool:
+        return self.base <= other.base
 
 
-KeyGeneratorDescription = (
+_KeyGenDesc = (
     Callable[[_BA], Key]
-    | KeyGeneratorTemplate[_BA]
-    | Sequence['KeyGeneratorDescription[_BA]']
+    | Sequence['_KeyGenDesc[_BA]']
 )
 
 
-def make_key_gen(desc: KeyGeneratorDescription[_BA]
-                 ) -> Callable[[_BA], Key]:
-    # Case 1: Lexicographic key
+def _keygen(
+    desc: _KeyGenDesc[_BA]
+) -> Callable[[_BA], Key]:
+    """
+    Make key generator from a key description.
+    """
+    # Lexicographic key
     if isinstance(desc, Sequence):
-        sub_gen = tuple((make_key_gen(sub_desc) for sub_desc in desc))
+        sub_gen = tuple((_keygen(sub_desc) for sub_desc in desc))
         def closure(blk: _BA) -> Key:
             return tuple((key_gen(blk) for key_gen in sub_gen))
         return closure
-    # Case 2: Key template (convertible to key generator)
-    if hasattr(desc, 'as_key_gen'):
-        return cast(KeyGeneratorTemplate, desc).as_key_gen()
-    # Case 3: Key generator directly given by caller
+
+    # Key generator directly given by caller
     return cast(Callable[[_BA], Key], desc)
 
 
+def compare_key(cmp: Callable[[_BA, _BA], int]) -> Callable[[_BA], Key]:
+    """
+    Make key generator from comparison function.
+
+    Comparison functions take two arguments and return an integer. For inputs
+    `a` and `b`, an input equal to `0` indicates that `a == b`, a negative
+    integer indicates `a < b`, and a positive integer indicates `a > b`.
+
+    In order to yield a valid sorting key, the comparison function must not
+    have any side effects and must satisfy the following axioms:
+
+    1. `cmp(a, a) == 0` for all `a`;
+    2. `cmp(a, b) == 0` if and only if `cmp(b, a) == 0`;
+    3. if `cmp(a, b) == 0` and `cmp(b, c) == 0`, then `cmp(a, c) == 0`;
+    4. if `cmp(a, b) < 0` and `cmp(b, c) < 0`, then `cmp(a, c) < 0`.
+
+    Internally, this function calls `functools.cmp_to_key()` to wrap the
+    compare function in a key object.
+
+    Args:
+        cmp: Compare function of signature `(B, B) -> int` where `B` is a
+            block type.
+
+    Returns:
+        Key generator of signature `(B) -> K` where `B` is the block type
+        accepted by `cmp` and `K` is a key object.
+    """
+    return cmp_to_key(cmp)
+
+
+def reverse_key(sub: _KeyGenDesc[_BA]) -> Callable[[_BA], Key]:
+    """
+    Make reversed key generator.
+
+    Args:
+        sub: Description of a key generator for a block type `B`.
+
+    Returns:
+        Key generator of signature `(B) -> K` where `B` is a block type and
+        `K` is a key object type. Key objects returned by this generator
+        encode the reversed order from the key described by `sub`.
+    """
+    sub_gen = _keygen(sub)
+
+    def reverse_key_gen(blk: _BA) -> _ReversedKey:
+        return _ReversedKey(sub_gen(blk))
+
+    return reverse_key_gen
+
+
+def _mro_get(cls: Type[_TK], map: Mapping[Type[_TK], _V],
+                default: _V | None = None) -> _V | None:
+    """
+    Look up values associated with a type with fallback by MRO.
+
+    If the type has no associated value, values associated with its ancestor
+    type are looked up according to the method resolution order (MRO). This
+    is used by `type_key()` to find sub-keys for subclasses.
+
+    This function can raise multiple exceptions on every invocation. Caching
+    its output is recommended.
+
+    Args:
+        cls: Type whose associated value is requested.
+        map: Mapping in which the value should be looked up.
+        default: Default value to return if no type in the MRO has an
+            associated value. Defaults to `None`.
+
+    Returns:
+        Value associated with the first type in the MRO of `cls` to appear in
+        `map` or `default` if none of them occur at all.
+    """
+    for key in cls.mro():
+        try:
+            return map[key]
+        except KeyError:
+            pass
+    return default
+
+
+def _mro_index(cls: Type[_TK], seq: Sequence[Type[_TK]],
+               default: int | None = None) -> int:
+    """
+    Look up index of a type with fallback by MRO.
+
+    If the type does not appear in the sequence, its ancestor type are looked
+    up according to the method resolution order (MRO). This is used by
+    `type_key()` to find types in the type order.
+
+    This function can raise multiple exceptions on every invocation. Caching
+    its output is recommended.
+
+    Args:
+        cls: Type whose index is requested
+        seq: Type order sequence
+        default: Default index to return if no type in the MRO appears in the
+            order sequence. Defaults to `len(seq)`.
+
+    Returns:
+        Index of the first type in the MRO of `cls` that occurs anywhere in
+        `seq` or `default` if no type in the MRO occurs in `seq`.
+    """
+    for key in cls.mro():
+        try:
+            return seq.index(key)
+        except KeyError:
+            pass
+
+    if default is None:
+        default = len(seq)
+    return default
+
+
 def type_key(order: Tuple[Type[Block], ...] | None = None,
-             sub_keys: Mapping[Type[Block], KeyGeneratorDescription] | None = None,
+             sub_keys: Mapping[Type[Block], _KeyGenDesc] | None = None,
              fallback_idx: int | None = None
              ) -> Callable[[Block], Key]:
     """
     Key generator to sort blocks by type.
+
+    Type-specific key generators can be invoked for specified sub-types.
+    Sub-keys must be comparable among all object types mapped to the same
+    index within the order tuple.
+
+    Args:
+        order: Tuple of block types dictating the outermost order of blocks.
+            A default order is applied if none is specified.
+        sub_keys: Optional dictionary of sub-key descriptions for specific
+            block types. Values must accept the key as an input type. Can be
+            used to specify keys that only apply, e.g., to entries.
+        fallback_idx: Optional index used for types not found in `order`.
+            Defaults to the length of `order`.
+
+    Returns:
+        Key generator of signature `(Block) -> (int, ?)`, where the integer
+        indicates the input block type's index in `order` and `?` is replaced
+        with the output of the respective sub-key generator. Blocks of the
+        exact same type are guaranteed to always use the same sub-key
+        generator.
+
+        For blocks of types not found in `order`, the blocks base types are
+        searched in method resolution order (MRO) until a type in `order` is
+        found. The result is internally cached for repeated lookups.
     """
     # Set default type order
     if order is None:
         order = (String, Preamble, Entry, ImplicitComment, ExplicitComment)
-    # Set default value for fallback index
-    if fallback_idx is None:
-        fallback_idx = len(order)
-
-    # Maps block type to order index (with allowance for subclasses)
-    def find_type(blk_type: Type[Block]) -> int:
-        try:
-            return order.index(blk_type)
-        except KeyError:
-            for idx, check_type in enumerate(order):
-                if issubclass(blk_type, check_type):
-                    return idx
-            return fallback_idx
 
     if sub_keys is None:
         # Cache type indices for subclasses
-        find_type = lru_cache(find_type)
+        simple_find = lru_cache(
+            lambda cls: _mro_index(cls, order, fallback_idx)
+        )
+        return lambda blk: simple_find(type(blk))
 
-        # Main key generator
-        def simple_key_closure(blk: Block) -> int:
-            return find_type(type(blk))
-        return simple_key_closure
-    else:
-        # Make subkey generators
-        sub_keys = {key: make_key_gen(value) for key, value in sub_keys.items()}
+    # More involved closure for index-subkey pair.
+    def find(cls: Type[_BA]) -> tuple[int, Callable[[Any], Key] | None]:
+        idx = _mro_index(cls, order, fallback_idx)
+        key_desc = _mro_get(cls, sub_keys)              # type: ignore
+        
+        if key_desc is None:
+            key_gen = None
+        else:
+            key_gen = _keygen(key_desc)
 
-        # Improved find closure
-        @lru_cache
-        def find_type_and_subkey(blk_type: Type[_BA]) -> tuple[int, Callable[[Any], Key] | None]:
-            # Find index in order tuple
-            type_idx = find_type(blk_type)
+        return idx, key_gen
+    wrap_find = lru_cache(find)
 
-            # Find subkey
-            try:
-                sub_key = cast(Callable[[_BA], Key], sub_keys[blk_type])
-            except KeyError:
-                sub_key = None
-                for key_type, key_gen in sub_keys.items():
-                    if issubclass(blk_type, key_type):
-                        sub_key = cast(Callable[[_BA], Key], key_gen)
-                        break
-
-            return type_idx, sub_key
-
-        # Main key generator
-        def complex_key_closure(blk: Block) -> Key:
-            blk_type = type(blk)
-            idx, sub_key_gen = find_type_and_subkey(blk_type)
-
-            if sub_key_gen is None:
-                return (idx,)
-            
-            sub_key = sub_key_gen(blk)
-            if isinstance(sub_key, Sequence):
-                return (idx, *sub_key)
-            return (idx, sub_key)
-        return complex_key_closure
-
-
-class BlockComparator(abc.ABC, Generic[_BA]):
-    def as_key(self) -> Callable[[_BA], Key]:
-        return cmp_to_key(self.__call__)
-
-    @abc.abstractmethod
-    def __call__(self, left: _BA, right: _BA) -> int:
-        ...
+    # Key generator closure.
+    def key_gen(blk: Block) -> Key:
+        idx, sub_key = wrap_find(type(blk))
+        if sub_key is None:
+            return (idx,)
+        return idx, sub_key(blk)
+    return key_gen
 
 
 @dataclass
@@ -166,7 +299,7 @@ class _BlockJunk:
 
     @property
     def main_block(self) -> Block:
-        """Returns the main (i.e., non-comment) block."""
+        """Return the main (i.e., non-comment) block."""
         try:
             return self.blocks[-1]
         except IndexError:
@@ -181,15 +314,18 @@ class SortBlocksMiddleware(LibraryMiddleware):
     TODO
     """
     _key: Callable[[Block], Key]
+    _reverse: bool
     _junk: bool
 
     def __init__(
         self,
-        key: KeyGeneratorDescription,
+        key: _KeyGenDesc,
+        reverse: bool = False,
         preserve_comments_on_top: bool = True,
         allow_inplace_modification: bool = True
     ):
-        self._key = make_key_gen(key)
+        self._key = _keygen(key)
+        self._reverse = reverse
         self._junk = preserve_comments_on_top
         super().__init__(
             allow_inplace_modification=allow_inplace_modification
@@ -197,42 +333,80 @@ class SortBlocksMiddleware(LibraryMiddleware):
 
     @staticmethod
     def _gather_junk(blocks: list[Block]) -> list[_BlockJunk]:
-        # Find indices of non-comment blocks
-        main_blk_idx = [
-            idx
-            for idx, blk in enumerate(blocks)
-            if not isinstance(blk, (ExplicitComment, ImplicitComment))
-        ]
+        """
+        Group blocks into junks.
 
-        # Assemble block junks by slicing between non-comment blocks
+        A junk is a group of a non-comment block and its preceding comments.
+        If `preserve_comments_on_top` is set, then they get moved as a unit
+        during sorting.
+
+        Internally used by `transform()`.
+
+        Args:
+            blocks: List of blocks to group.
+
+        Returns:
+            List of block junks in the same order in which they exist in
+            `blocks`.
+        """
+        # Assemble block junks by slicing between non-comment blocks. This
+        # is a list comprehension that iterates over an inner generator. The
+        # generator yields indices of non-comment blocks. The list
+        # comprehension slices from the end of the preceding junk up to the
+        # next non-comment block.
         # NOTE: Makes use of left-to-right execution order in sub-expressions
-        first_pos = 0
-        return [
-            _BlockJunk(blocks=blocks[first_pos:(first_pos := last_pos + 1)])
-            for last_pos in main_blk_idx
+        slc_first = 0
+        junks = [
+            _BlockJunk(blocks=blocks[slc_first:(slc_first := slc_last + 1)])
+            for slc_last in (
+                idx for idx, blk in enumerate(blocks)
+                if not isinstance(blk, (ExplicitComment, ImplicitComment))
+            )
         ]
 
+        # Handle edge case of trailing comments.
+        if slc_first < len(blocks):
+            junks.append(_BlockJunk(blocks=blocks[slc_first:]))
+
+        return junks
+        
     @staticmethod
     def _junk_key(key: Callable[[Block], Key]) -> Callable[[_BlockJunk], Key]:
         """
-        Adapt block sorting key for use on block junks.
-        """
-        def key_closure(junk: _BlockJunk) -> Key:
-            return key(junk.main_block)
-        return key_closure
+        Adapt sorting key generator for use on block junks.
 
+        The adapted key generator always returns the key associated with the
+        last block in the junk. Note that in rare edge cases, this can be a
+        comment block.
+
+        Internally used by `transform()`.
+
+        Args:
+            key: Key generator for blocks.
+
+        Returns:
+            Adapted key generator for junks.
+        """
+        return lambda junk: key(junk.main_block)
+
+    @override
     def transform(self, library: Library) -> Library:
+        # Get block list and copy if inplace modification is prohibited.
         blocks = library.blocks
         if not (inplace := self.allow_inplace_modification):
             blocks = deepcopy(blocks)
 
+        # Perform sorting. Always writes result to `blocks`.
         if self._junk:
             junks = self._gather_junk(blocks)
-            junks.sort(key=self._junk_key(self._key))
-            blocks[:] = [blk for junk in junks for blk in junk.blocks]
+            junks.sort(key=self._junk_key(self._key), reverse=self._reverse)
+            blocks[:] = (blk for junk in junks for blk in junk.blocks)
         else:
-            blocks.sort(key=self._key)
+            blocks.sort(key=self._key, reverse=self._reverse)
 
+        # Create new library if a copy was generated.
+        # NOTE: If `inplace` is set, then `blocks` should still reference
+        #     `library.blocks`.
         if inplace:
             return library
         else:
@@ -252,7 +426,7 @@ class SortBlocksByTypeAndKeyMiddleware(SortBlocksMiddleware):
             key=type_key(
                 order=block_type_order,
                 sub_keys={
-                    Entry: operator.attrgetter('entry_type')
+                    Entry: operator.attrgetter('entry_type', 'key')
                 }
             ),
             preserve_comments_on_top=preserve_comments_on_top,
