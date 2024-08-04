@@ -1,11 +1,10 @@
-import abc
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from dataclasses import field
 from functools import cmp_to_key, lru_cache
 import operator
-from typing import Any, Generic, TypeVar, cast, overload, override
+from typing import Any, Generic, TypeVar, cast, override
 from typing import List
 from typing import Protocol
 from typing import Tuple
@@ -218,7 +217,7 @@ def _mro_index(cls: Type[_TK], seq: Sequence[Type[_TK]],
     for key in cls.mro():
         try:
             return seq.index(key)
-        except KeyError:
+        except ValueError:
             pass
 
     if default is None:
@@ -288,6 +287,28 @@ def type_key(order: Tuple[Type[Block], ...] | None = None,
             return (idx,)
         return idx, sub_key(blk)
     return key_gen
+
+
+def fallback_key(
+    key: _KeyGenDesc[_BA], fallback: Key,
+    exc_cls: Collection[Type[Exception]] | Type[Exception] | None = None
+) -> Callable[[_BA], Key]:
+    # Ensure that `exc_cls` is either an exception type or a tuple of such.
+    if exc_cls is None:
+        exc_cls = Exception
+    if not isinstance(exc_cls, (tuple, Type)):
+        exc_cls = tuple(exc_cls)
+
+    # Build a sub-key generator.
+    sub_key_gen = _keygen(key)
+
+    # Wrap the sub-key generator in a try-except block.
+    def closure(blk: _BA) -> Key:
+        try:
+            return sub_key_gen(blk)
+        except exc_cls:
+            return fallback
+    return closure
 
 
 @dataclass
@@ -448,11 +469,9 @@ class SortBlocksByTypeAndKeyMiddleware(SortBlocksMiddleware):
         allow_inplace_modification: bool = False
     ):
         super().__init__(
-            key=type_key(
-                order=block_type_order,
-                sub_keys={
-                    Entry: operator.attrgetter('entry_type', 'key')
-                }
+            key=(
+                type_key(order=block_type_order),
+                fallback_key(operator.attrgetter('key'), fallback=''),
             ),
             preserve_comments_on_top=preserve_comments_on_top,
             allow_inplace_modification=allow_inplace_modification
